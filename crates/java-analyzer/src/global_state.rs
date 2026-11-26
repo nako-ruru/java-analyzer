@@ -941,11 +941,7 @@ impl GlobalState {
             });
             let response = match result {
                 Ok(value) => Response::new_ok(id, value),
-                Err(err) => Response::new_err(
-                    id,
-                    ErrorCode::InternalError as i32,
-                    err.to_string(),
-                ),
+                Err(err) => Response::new_err(id, ErrorCode::InternalError as i32, err.to_string()),
             };
             self.respond(response);
         } else {
@@ -958,11 +954,7 @@ impl GlobalState {
             });
             let response = match result {
                 Ok(value) => Response::new_ok(id, value),
-                Err(err) => Response::new_err(
-                    id,
-                    ErrorCode::InternalError as i32,
-                    err.to_string(),
-                ),
+                Err(err) => Response::new_err(id, ErrorCode::InternalError as i32, err.to_string()),
             };
             self.respond(response);
         }
