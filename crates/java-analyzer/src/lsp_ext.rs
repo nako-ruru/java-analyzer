@@ -32,3 +32,33 @@ pub struct ClassFileParams {
 pub struct ClassFileResult {
     pub uri: Url,
 }
+
+/// `java-analyzer/revisionDefinition`：`text` 里 `position` 处的定义，按
+/// `path` 这个文件的 Git 修订版本来分析。磁盘上的文件和编辑器里的文档都不变。
+pub enum RevisionDefinition {}
+
+impl lsp_types::request::Request for RevisionDefinition {
+    type Params = RevisionParams;
+    type Result = Option<lsp_types::GotoDefinitionResponse>;
+    const METHOD: &'static str = "java-analyzer/revisionDefinition";
+}
+
+/// `java-analyzer/revisionSemanticTokens`：`text` 自己的语义着色，坐标是这份文本的。
+pub enum RevisionSemanticTokens {}
+
+impl lsp_types::request::Request for RevisionSemanticTokens {
+    type Params = RevisionParams;
+    type Result = Option<lsp_types::SemanticTokens>;
+    const METHOD: &'static str = "java-analyzer/revisionSemanticTokens";
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionParams {
+    /// 文件本身的位置（工作区里的 `file:` URI）。
+    pub path: Url,
+    /// 修订版本的内容。
+    pub text: String,
+    /// `revisionDefinition` 要查的位置，坐标属于 `text`。
+    pub position: lsp_types::Position,
+}
