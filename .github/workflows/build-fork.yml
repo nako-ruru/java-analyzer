@@ -1,0 +1,21 @@
+name: Build fork (revision navigation)
+
+# Temporary: builds a Windows binary for the feasibility branch. Remove before
+# opening a PR upstream.
+on:
+  push:
+    branches: [feat/revision-navigation]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --package java-analyzer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: java-analyzer-windows-x86_64
+          path: target/release/java-analyzer.exe
