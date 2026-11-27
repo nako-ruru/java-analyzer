@@ -14,7 +14,7 @@ use anyhow::Context;
 use base_db::{ProjectGraph, SourceRootKind};
 use classfile::ClassPath;
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
-use ide::{Analysis, AnalysisHost, Change, FileChange, FileId, FileKind};
+use ide::{Analysis, AnalysisHost, Change, FileChange, FileId, FileKind, FilePosition};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{notification::Notification as _, request::Request as _, Url};
 use project_model::LoadedProject;
@@ -174,6 +174,8 @@ pub struct GlobalState {
     downloading_sources: bool,
     /// 工程导入期间收到、要等导入完成再处理的请求（结果依赖完整的类路径）
     deferred_requests: Vec<Request>,
+    /// A revision swap is in progress: the text of one file is not the working copy.
+    swapping_revision: bool,
 }
 
 impl GlobalState {
@@ -206,6 +208,7 @@ impl GlobalState {
             source_downloads: Vec::new(),
             downloading_sources: false,
             deferred_requests: Vec::new(),
+            swapping_revision: false,
         }
     }
 
@@ -420,6 +423,8 @@ impl GlobalState {
         // 导入完成前类路径和工程模型不完整，答案可能是错的：先存起来
         if self.loading
             && (request.method == lsp_ext::ClassFile::METHOD
+                || request.method == lsp_ext::RevisionDefinition::METHOD
+                || request.method == lsp_ext::RevisionSemanticTokens::METHOD
                 || request.method == project_classpath::METHOD)
         {
             self.deferred_requests.push(request);
@@ -430,6 +435,13 @@ impl GlobalState {
 
     /// 把请求交给对应的处理函数（在线程池上执行）。
     fn dispatch(&mut self, request: Request) {
+        // 修订版分析要临时改数据库里的一个文件，只能在主线程上做
+        if request.method == lsp_ext::RevisionDefinition::METHOD
+            || request.method == lsp_ext::RevisionSemanticTokens::METHOD
+        {
+            self.answer_revision_request(request);
+            return;
+        }
         // 只读工程模型，直接在主线程上回答
         if request.method == project_classpath::METHOD {
             self.answer_project_classpath(request);
@@ -883,6 +895,15 @@ impl GlobalState {
     }
 
     fn process_changes(&mut self) {
+        self.apply_vfs_changes(true);
+    }
+
+    /// 修订版分析用的变更：应用文件内容，但不发布诊断（快照里的错误不属于编辑器）。
+    fn process_changes_quiet(&mut self) {
+        self.apply_vfs_changes(false);
+    }
+
+    fn apply_vfs_changes(&mut self, diagnostics: bool) {
         let (files, resources) = self.take_file_changes();
         if files.is_empty() && resources.is_none() {
             return;
@@ -892,12 +913,122 @@ impl GlobalState {
             resources,
             ..Change::default()
         });
-        self.push_diagnostics();
+        if diagnostics {
+            self.push_diagnostics();
+        }
+    }
+
+    /// 修订版文本的分析：临时把该文件在数据库里的文本换成 revision 的内容，
+    /// 分析完再换回来。不改变磁盘、编辑器文档，也不发布诊断。
+    fn answer_revision_request(&mut self, request: Request) {
+        let id = request.id;
+        let definition = request.method == lsp_ext::RevisionDefinition::METHOD;
+        let params = match serde_json::from_value::<lsp_ext::RevisionParams>(request.params) {
+            Ok(params) => params,
+            Err(err) => {
+                self.respond(Response::new_err(
+                    id,
+                    ErrorCode::InvalidParams as i32,
+                    err.to_string(),
+                ));
+                return;
+            }
+        };
+        if definition {
+            let result = self.with_revision_text(params, |snap, file_id, doc, position| {
+                let found = snap.analysis.goto_definition(FilePosition {
+                    file_id,
+                    offset: doc.offset(position),
+                })?;
+                handlers::goto_response(snap, doc, found)
+            });
+            let response = match result {
+                Ok(value) => Response::new_ok(id, value),
+                Err(err) => Response::new_err(id, ErrorCode::InternalError as i32, err.to_string()),
+            };
+            self.respond(response);
+        } else {
+            let result = self.with_revision_text(params, |snap, file_id, doc, _| {
+                let ranges = snap.analysis.highlight(file_id, None)?;
+                Ok(Some(lsp_types::SemanticTokens {
+                    result_id: None,
+                    data: proto::semantic_tokens(doc, ranges),
+                }))
+            });
+            let response = match result {
+                Ok(value) => Response::new_ok(id, value),
+                Err(err) => Response::new_err(id, ErrorCode::InternalError as i32, err.to_string()),
+            };
+            self.respond(response);
+        }
+    }
+
+    fn with_revision_text<T>(
+        &mut self,
+        params: lsp_ext::RevisionParams,
+        analyze: impl FnOnce(&Snapshot, FileId, &Doc, lsp_types::Position) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let path = proto::url_to_path(&params.text_document.uri)?;
+        let position = params.position;
+        let Some(file_id) = self
+            .vfs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .file_id(&path)
+        else {
+            anyhow::bail!(base_db::tr!(
+                "不是工作区里的文件",
+                "not a file of the workspace"
+            ));
+        };
+        let previous = {
+            let vfs = self.vfs.read().unwrap_or_else(|e| e.into_inner());
+            if vfs.is_overlaid(file_id) {
+                vfs.file_contents(file_id).map(|text| text.to_string())
+            } else {
+                None
+            }
+        };
+        self.swapping_revision = true;
+        self.vfs_mut().set_overlay(&path, Some(params.text));
+        self.process_changes_quiet();
+        let result = (|| {
+            let snap = self.snapshot();
+            let doc = snap.doc(file_id)?;
+            analyze(&snap, file_id, &doc, position)
+        })();
+        self.vfs_mut().set_overlay(&path, previous);
+        self.process_changes_quiet();
+        self.swapping_revision = false;
+        // The swap must not leave the file with errors computed from the
+        // revision text: publish the working copy's diagnostics again.
+        self.push_file_diagnostics(file_id);
+        result
+    }
+
+    /// 修订版交换之后重新发布一个文件的诊断，避免编辑器留下 HEAD 的错误。
+    fn push_file_diagnostics(&mut self, file_id: FileId) {
+        if self.config.pull_diagnostics {
+            self.request::<lsp_types::request::WorkspaceDiagnosticRefresh>((), |_, _| {});
+            return;
+        }
+        let Some(version) = self.open_files.get(&file_id).copied() else { return };
+        let snap = self.snapshot();
+        let tx = self.task_tx.clone();
+        self.pool.spawn(Tier::Normal, move || {
+            if let Ok(Some((url, diagnostics))) = handlers::compute_diagnostics(&snap, file_id) {
+                let _ = tx.send(Task::Diagnostics {
+                    url,
+                    version: Some(version),
+                    diagnostics,
+                });
+            }
+        });
     }
 
     /// push 模型：为所有打开的文件重新计算诊断。
     fn push_diagnostics(&mut self) {
-        if self.config.pull_diagnostics {
+        if self.config.pull_diagnostics || self.swapping_revision {
             return;
         }
         let open: Vec<(FileId, i32)> = self.open_files.iter().map(|(id, v)| (*id, *v)).collect();
@@ -920,6 +1051,9 @@ impl GlobalState {
 
     /// 语义结果整体变了（工程重新导入、索引完成）：让客户端重新取。
     fn refresh_client(&mut self) {
+        if self.swapping_revision {
+            return;
+        }
         self.push_diagnostics();
         if self.config.pull_diagnostics && self.config.diagnostic_refresh {
             self.request::<lsp_types::request::WorkspaceDiagnosticRefresh>((), |_, _| {});

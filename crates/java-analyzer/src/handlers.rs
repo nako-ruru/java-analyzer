@@ -188,7 +188,7 @@ pub fn hover(snap: Snapshot, params: lsp::HoverParams) -> anyhow::Result<Option<
     }))
 }
 
-fn goto_response(
+pub(crate) fn goto_response(
     snap: &Snapshot,
     doc: &Doc,
     result: Option<RangeInfo<Vec<NavigationTarget>>>,
