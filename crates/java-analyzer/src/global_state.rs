@@ -968,7 +968,7 @@ impl GlobalState {
         params: lsp_ext::RevisionParams,
         analyze: impl FnOnce(&Snapshot, FileId, &Doc, lsp_types::Position) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let path = proto::url_to_path(&params.path)?;
+        let path = proto::url_to_path(&params.text_document.uri)?;
         let position = params.position;
         let Some(file_id) = self
             .vfs
