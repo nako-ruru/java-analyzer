@@ -174,6 +174,8 @@ pub struct GlobalState {
     downloading_sources: bool,
     /// 工程导入期间收到、要等导入完成再处理的请求（结果依赖完整的类路径）
     deferred_requests: Vec<Request>,
+    /// A revision swap is in progress: the text of one file is not the working copy.
+    swapping_revision: bool,
 }
 
 impl GlobalState {
@@ -206,6 +208,7 @@ impl GlobalState {
             source_downloads: Vec::new(),
             downloading_sources: false,
             deferred_requests: Vec::new(),
+            swapping_revision: false,
         }
     }
 
@@ -986,6 +989,7 @@ impl GlobalState {
                 None
             }
         };
+        self.swapping_revision = true;
         self.vfs_mut().set_overlay(&path, Some(params.text));
         self.process_changes_quiet();
         let result = (|| {
@@ -995,12 +999,36 @@ impl GlobalState {
         })();
         self.vfs_mut().set_overlay(&path, previous);
         self.process_changes_quiet();
+        self.swapping_revision = false;
+        // The swap must not leave the file with errors computed from the
+        // revision text: publish the working copy's diagnostics again.
+        self.push_file_diagnostics(file_id);
         result
+    }
+
+    /// 修订版交换之后重新发布一个文件的诊断，避免编辑器留下 HEAD 的错误。
+    fn push_file_diagnostics(&mut self, file_id: FileId) {
+        if self.config.pull_diagnostics {
+            self.request::<lsp_types::request::WorkspaceDiagnosticRefresh>((), |_, _| {});
+            return;
+        }
+        let Some(version) = self.open_files.get(&file_id).copied() else { return };
+        let snap = self.snapshot();
+        let tx = self.task_tx.clone();
+        self.pool.spawn(Tier::Normal, move || {
+            if let Ok(Some((url, diagnostics))) = handlers::compute_diagnostics(&snap, file_id) {
+                let _ = tx.send(Task::Diagnostics {
+                    url,
+                    version: Some(version),
+                    diagnostics,
+                });
+            }
+        });
     }
 
     /// push 模型：为所有打开的文件重新计算诊断。
     fn push_diagnostics(&mut self) {
-        if self.config.pull_diagnostics {
+        if self.config.pull_diagnostics || self.swapping_revision {
             return;
         }
         let open: Vec<(FileId, i32)> = self.open_files.iter().map(|(id, v)| (*id, *v)).collect();
@@ -1023,6 +1051,9 @@ impl GlobalState {
 
     /// 语义结果整体变了（工程重新导入、索引完成）：让客户端重新取。
     fn refresh_client(&mut self) {
+        if self.swapping_revision {
+            return;
+        }
         self.push_diagnostics();
         if self.config.pull_diagnostics && self.config.diagnostic_refresh {
             self.request::<lsp_types::request::WorkspaceDiagnosticRefresh>((), |_, _| {});
